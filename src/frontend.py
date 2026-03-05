@@ -1,3 +1,7 @@
+import select
+import sys
+import termios
+import tty
 from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
@@ -181,27 +185,53 @@ class FanMonitor:
         head = Text(" RPi Smart Fan Control System ", style="bold white on blue")
         layout["header"].update(Panel(Align.center(head), box=box.HEAVY, style="blue"))
         
-        footer = Text("Press Ctrl+C to minimize TUI", style="dim")
+        footer = Text("Press 'q' or Ctrl+C to minimize TUI", style="dim")
         layout["footer"].update(Panel(Align.center(footer), box=box.SIMPLE))
 
-        with Live(layout, refresh_per_second=2, screen=True):
-            while True:
-                status = self.read_status()
-                
-                # Dynamic update
-                layout["left"]["temp_box"].update(self.get_temp_panel(status))
-                layout["left"]["fan_box"].update(self.get_fan_panel(status))
-                
-                layout["right"]["sys_box"].update(self.get_system_panel())
-                layout["right"]["pid_box"].update(self.get_pid_panel(status))
-                
-                time.sleep(0.5)
+        # Check if stdin is a tty
+        is_tty = sys.stdin.isatty()
+        old_settings = None
+
+        try:
+            # Setup terminal
+            if is_tty:
+                old_settings = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+
+            with Live(layout, refresh_per_second=2, screen=True):
+                while True:
+                    # Check for key press
+                    if is_tty:
+                        rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+                        if rlist:
+                            key = sys.stdin.read(1)
+                            if key.lower() == 'q':
+                                break
+
+                    status = self.read_status()
+                    
+                    # Dynamic update
+                    layout["left"]["temp_box"].update(self.get_temp_panel(status))
+                    layout["left"]["fan_box"].update(self.get_fan_panel(status))
+                    
+                    layout["right"]["sys_box"].update(self.get_system_panel())
+                    layout["right"]["pid_box"].update(self.get_pid_panel(status))
+                    
+                    # we can sleep here if necessary, or let select handle timing
+                    if not is_tty:
+                        time.sleep(0.5)
+
+        finally:
+            if is_tty and old_settings:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 def main():
     try:
         FanMonitor().run()
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        sys.stderr.write(f"Error: {e}\n")
 
 if __name__ == "__main__":
     main()
