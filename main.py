@@ -1,150 +1,225 @@
+#!/usr/bin/env python3
 import RPi.GPIO as GPIO
-import os
 import time
+import json
+import logging
+import signal
+import sys
+import os
 
-fanOn = False
-# 添加计数器
-turn_on = 0
-turn_off = 0
-  
-# 定义默认温度
-defaultTemp = 45
-# 定义默认监控间隔
-defaultTime = 5
+# 读取基础配置
+LOG_FILE = "fan_control.log"
+CONFIG_FILE = "config.json"
 
-# 获取目标温度
-def getWantTemp():
-    try:
-        with open("TempSet.txt", "r") as setFile:
-            wantTemp = int(setFile.read().strip())
-    except (FileNotFoundError, IOError, ValueError):
-        with open("TempSet.txt", "w") as setFile:
-            setFile.write(str(defaultTemp))
-        print("没有设置文件，创建一个！")
-        wantTemp = defaultTemp
-    except Exception as e:
-        print(f"文件无法写入！将使用默认值 {defaultTemp}")
-        wantTemp = defaultTemp
-    return wantTemp
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
-# 获取温控延时
-def getWantTime():
-    try:
-        with open("TimeSet.txt", "r") as setFile:
-            wantTime = int(setFile.read().strip())
-    except (FileNotFoundError, IOError, ValueError):
-        with open("TimeSet.txt", "w") as setFile:
-            setFile.write(str(defaultTime))
-        print("没有设置文件，创建一个！")
-        wantTime = defaultTime
-    except Exception as e:
-        print(f"文件无法写入！将使用默认值 {defaultTime}")
-        wantTime = defaultTime
-    return wantTime
-
-# 控制风扇
-def controlFan(on):
-    global fanOn,turn_on,turn_off
-    fanOn = GPIO.input(18)
-    print(f"{on} {fanOn}")
-    if fanOn != on:
-        print(f"尝试将风扇状态更改为: {on}", end='')
-        GPIO.output(18, on)
-        fanOn = GPIO.input(18)  # 更新fanOn的状态
-        if on == True:
-            turn_on+=1
-        else:
-            turn_off+=1
-        print(f"，完成，当前{fanOn}")
+class PID:
+    """
+    PID 控制器
+    P: 比例控制
+    I: 积分控制 (消除静差)
+    D: 微分控制 (预测趋势)
+    """
+    def __init__(self, kp, ki, kd, setpoint):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.setpoint = setpoint
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.last_time = None
         
+        # 积分限幅，防止积分项无限累积 (Anti-windup)
+        # 对应占空比 100%
+        self.integral_limit = 100.0 / (self.ki if self.ki > 0 else 1.0)
 
-# 获取CPU温度
-def getTemp():
-    with open("/sys/class/thermal/thermal_zone0/temp", "r") as tempFile:
-        temp = int(tempFile.read().strip())
-    return temp / 1000
+    def update(self, current_value):
+        current_time = time.time()
+        
+        if self.last_time is None:
+            self.last_time = current_time
+            dt = 0
+        else:
+            dt = current_time - self.last_time
 
-# GPIO设置
-def setup_gpio():
-    GPIO.setwarnings(False)
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(18, GPIO.OUT)
+        error = current_value - self.setpoint
+        
+        # 只有在有时间流逝时才更新积分和微分
+        if dt > 0:
+            self.integral += error * dt
+            # 积分限幅
+            self.integral = max(-self.integral_limit, min(self.integral_limit, self.integral))
+            
+            derivative = (error - self.prev_error) / dt
+        else:
+            derivative = 0
 
+        # PID 输出计算
+        # 输出值预期为 PWM 增量或直接占空比
+        output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        
+        self.prev_error = error
+        self.last_time = current_time
+        return output
 
-# 清理GPIO设置
-def cleanup_gpio():
-    GPIO.cleanup()
+class FanController:
+    def __init__(self, config_path):
+        self.config_path = config_path
+        self.pwm = None
+        self.running = False
+        self.load_config()
+        
+    def load_config(self):
+        try:
+            if not os.path.exists(self.config_path):
+                logging.error(f"配置文件 {self.config_path} 不存在")
+                sys.exit(1)
+                
+            with open(self.config_path, 'r') as f:
+                self.config = json.load(f)
+            logging.info("配置加载成功")
+        except Exception as e:
+            logging.error(f"加载配置失败: {e}")
+            sys.exit(1)
 
-# 主程序
-def main():
-    setup_gpio()
-    desired_temp = getWantTemp()
-    current_temp =  getTemp()
-    sleep_time = getWantTime()
-    fanOn = GPIO.input(18)
-    print("初始化完成,启用对风扇的自动控制，使用^C进入菜单")
-    
-    showMenu = False
-    try:
-       while True:
-          if showMenu is not False:
-             # 显示菜单
-             current_temp =  getTemp()
-             os.system('cls' if os.name == 'nt' else 'clear')
-             print(f"当前风扇状态: {GPIO.input(18)},当前温度：{getWantTemp()}")
-             print(f"开启: {turn_on}次,关闭：{turn_off}次")
-             print("\ton:临时打开风扇\n\toff:临时关闭风扇\n\tea:启动对风扇的自动控制\n\t^C:关闭对风扇的自动控制\n\texit/^C:退出程序")
-             user_input = input("请输入命令 (on/off/ea/exit): ").strip().lower()
-             if user_input == 'on':
-                  controlFan(True)
-                  print(f"风扇暂时开启，当前温度: {current_temp}℃")
-                  time.sleep(3)
-                  continue
-             elif user_input == 'off':
-                  controlFan(False)
-                  print(f"风扇暂时关闭，当前温度: {current_temp}℃")
-                  time.sleep(3)
-                  continue
-             elif user_input == 'ea':
-                  print("风扇控制已开启。")
-             elif user_input == 'exit':
-                  print("程序将退出。")
-                  break
-             else:
-                  print("无效的命令，请输入 'start'、'stop' 或 'exit'。")
-                  time.sleep(1)
-                  continue
+    def setup_hardware(self):
+        try:
+            # 硬件配置
+            hw_conf = self.config['hardware']
+            pin = hw_conf['gpio_pin']
+            freq = hw_conf['pwm_frequency']
+            
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(pin, GPIO.OUT)
+            
+            # 初始化 PWM
+            self.pwm = GPIO.PWM(pin, freq)
+            self.pwm.start(0)
+            logging.info(f"GPIO {pin} 初始化 PID模式，频率 {freq}Hz")
+            
+        except Exception as e:
+            logging.error(f"GPIO 初始化失败: {e}")
+            if self.pwm:
+                self.pwm.stop()
+            GPIO.cleanup()
+            sys.exit(1)
 
-            # 如果风扇控制激活，根据温度控制风扇
-          while True:
-             try:
-                # desired_temp = getWantTemp()
-                current_temp =  getTemp()
-                # sleep_time = getWantTime()
-                # fanOn = GPIO.input(18)
-                # print("数据更新完成")
-                if current_temp is not None:
-                  if current_temp > desired_temp:
-                          print(f"当前温度：{current_temp}℃ ,设定温度:{desired_temp}℃ ", end='')
-                          controlFan(True)
-                          print(",风扇开启")
-                  elif current_temp < (desired_temp-5):
-                          print(f"当前温度：{current_temp}℃ ,设定温度:{desired_temp}℃ ", end='')
-                          controlFan(False)
-                          print(f",风扇关闭")
-                  else:
-                          print(f"当前温度：{current_temp}℃ ，在暂缓区间{desired_temp}℃ -{(desired_temp-5)}℃ 内，当前风扇 {GPIO.input(18)}")
-                time.sleep(sleep_time)  # 简短的延时，以避免频繁读取温度
-             except KeyboardInterrupt:
-               print("\n风扇控制已停止。")
-               showMenu = 1
-               time.sleep(1)
-               break
+    def get_cpu_temp(self):
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+                return float(f.read()) / 1000.0
+        except:
+            return 0.0
 
-    except KeyboardInterrupt:
-        print("\n程序被用户中断。")
-        cleanup_gpio()
-    
+    def cleanup(self):
+        logging.info("正在清理资源...")
+        self.running = False
+        if self.pwm:
+            try:
+                self.pwm.stop()
+            except:
+                pass
+        try:
+            GPIO.cleanup()
+        except:
+             pass
+        logging.info("程序已退出")
+
+    def run(self):
+        self.setup_hardware()
+        
+        # 获取参数
+        target_temp = self.config['temperature']['target_temp']
+        min_temp = self.config['temperature']['min_temp_limit']
+        max_temp = self.config['temperature']['max_temp_limit']
+        check_interval = self.config['temperature']['check_interval']
+        
+        min_duty = self.config['fan']['min_duty_cycle']
+        max_duty = self.config['fan']['max_duty_cycle']
+        
+        # 初始化 PID
+        pid_conf = self.config['pid']
+        pid = PID(
+            kp=pid_conf['kp'],
+            ki=pid_conf['ki'],
+            kd=pid_conf['kd'],
+            setpoint=target_temp
+        )
+        
+        self.running = True
+        logging.info(f"开始温控循环. 目标: {target_temp}°C (区间: {min_temp}-{max_temp}°C)")
+        
+        try:
+            while self.running:
+                current_temp = self.get_cpu_temp()
+                
+                # 安全逻辑：如果超过最大限制，强制全速
+                if current_temp >= max_temp:
+                    duty_cycle = 100
+                    logging.warning(f"温度过高 ({current_temp}°C)! 强制全速")
+                    
+                # 节能逻辑：如果低于最小限制，完全关闭
+                elif current_temp <= min_temp:
+                    duty_cycle = 0
+                    pid.integral = 0 # 重置积分项，防止积累过大误差
+                    
+                else:
+                    # PID 计算
+                    # 只有在温度高于最低阈值且低于最高阈值时才启用PID微调
+                    
+                    # 基础转速 + PID调整
+                    # 我们的目标是把温度控制在 target_temp
+                    # 如果当前温度高于目标，输出正值 -> 增加转速
+                    
+                    pid_out = pid.update(current_temp)
+                    
+                    # 将 PID 输出转换为 PWM 占空比
+                    # 假设我们期望 PID 输出能够覆盖 0-100 的范围
+                    # 这里需要根据 Kp 调整，如果 Kp=5, 误差 10度 -> 输出 50%
+                    
+                    if pid_out < 0: pid_out = 0
+                    
+                    # 基础占空比 + PID 输出
+                    # 如果温度刚到 target，pid_out 接近 0。
+                    # 我们可能需要一个基础转速来维持在这个温度，这由 K_i 积分项自动调整
+                    
+                    duty_cycle = pid_out
+                    
+                    # 限制范围
+                    duty_cycle = max(min_duty, min(max_duty, duty_cycle))
+
+                # 应用 PWM
+                if self.pwm:
+                    self.pwm.ChangeDutyCycle(duty_cycle)
+                
+                logging.info(f"Temp: {current_temp:.1f}°C | Target: {target_temp}°C | Fan: {duty_cycle:.1f}%")
+                
+                time.sleep(check_interval)
+                
+        except KeyboardInterrupt:
+            logging.info("接收到中断信号")
+        except Exception as e:
+            logging.error(f"运行时错误: {e}")
+        finally:
+            self.cleanup()
 
 if __name__ == "__main__":
-    main()
+    controller = FanController(CONFIG_FILE)
+    
+    # 注册信号处理
+    def signal_handler(sig, frame):
+        controller.cleanup()
+        sys.exit(0)
+        
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    controller.run()
