@@ -5,11 +5,8 @@ After=multi-user.target
 [Service]
 Type=simple
 User=root
-# 假设安装在 /usr/local/bin/fan-backend
-# 或者直接运行 python 脚本
-# 这里我们需要根据实际安装位置调整，通常使用 python -m src.backend
-# 推荐使用 uv run 或者 venv python
-WorkingDirectory=/home/snow/tempC
+# 项目的位置
+WorkingDirectory=/path/to/RPiFan
 ExecStart=/usr/bin/python3 -m src.backend
 Restart=always
 RestartSec=5
